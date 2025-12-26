@@ -9,30 +9,46 @@ PHDRS
    phboot  PT_LOAD FLAGS (7);
    phstack PT_LOAD FLAGS (6);
    phsetup PT_LOAD FLAGS (7);
-   phuser  PT_LOAD FLAGS (7);  /* <--- NOUVEAU : Segment pour l'utilisateur */
+   phuser  PT_LOAD FLAGS (7);
 }
 
 SECTIONS
 {
+   /* Noyau placé à 3MB */
    . = 0x300000;
-   .mbh      : { KEEP(*(.mbh)) . = ALIGN(4);      } : phboot
-   .stack    : { KEEP(*(.stack))                  } : phstack
+
+   .mbh      : ALIGN(4)      { KEEP(*(.mbh)) } : phboot
+   .stack    : ALIGN(16)     { KEEP(*(.stack)) } : phstack
 
    __kernel_start__ = .;
 
-   .idt_jmp  : { KEEP(*(.idt_jmp))                } : phsetup
-   .text     : { *(.text)                         } : phsetup
-   .rodata   : { *(.rodata)                       } : phsetup
-   .data     : { *(.data)                         } : phsetup
-   .bss      : { *(.bss COMMON)                   } : phsetup
+   .idt_jmp  : ALIGN(16)     { KEEP(*(.idt_jmp)) } : phsetup
 
-   /* === C'EST ICI QUE TOUT SE JOUE === */
-   /* On avance à 4MB (0x400000) pour isoler le code utilisateur */
+   /* Attraper aussi les sous-sections (.text.* etc.) */
+   .text     : ALIGN(16)     { *(.text .text.*) } : phsetup
+   .rodata   : ALIGN(16)     { *(.rodata .rodata.*) } : phsetup
+   .data     : ALIGN(16)     { *(.data .data.*) } : phsetup
+   .bss      : ALIGN(16)     { *(.bss .bss.* COMMON) } : phsetup
+
+   /*
+    * IMPORTANT :
+    * On saute exactement à 4MB (frontière PDE 4MB) pour que le mapping pgd[1]
+    * (VA 4..8MB) corresponde.
+    */
    . = 0x400000;
-   
-   /* On place la section .user ici physiquement */
-   .user     : { *(.user)                         } : phuser
+
+   /*
+    * Section user : alignée 4KB (pages), et KEEP pour éviter l’élimination
+    * si la section n’est pas “référencée” selon la config.
+    */
+   .user : ALIGN(4096)
+   {
+      KEEP(*(.user))
+      KEEP(*(.user.*))
+   } : phuser
 
    __kernel_end__ = .;
-   /DISCARD/ : { *(.note* .indent .comment)       } : phsetup
+
+   /DISCARD/ : { *(.note* .indent .comment) }
 }
+

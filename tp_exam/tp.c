@@ -8,8 +8,20 @@
 #include <intr.h>
 #include <asm.h>
 
-/* ==========================================================================
- * 1. WRAPPERS ASSEMBLEUR
+/* ----------------------------------------------------------------------------
+ * SecOS exam: 2 tâches ring3 préemptives + syscall + page partagée.
+ *
+ * - IRQ0 (timer) : alterne T1/T2 en changeant ESP + CR3
+ * - int 0x80     : syscall "affiche compteur" pour T2
+ * - Paging par tâche : PGD/PT propres + page physique partagée mappée à 2 VA
+ * -------------------------------------------------------------------------- */
+
+/* ============================================================================
+ * 1) WRAPPERS ASM (IRQ0 + syscall)
+ * - Sauve regs/segments, force DS/ES noyau, appelle la logique C,
+ *   puis restaure et iret.
+ * - timer_wrapper: la logique C renvoie un nouvel ESP (changement de contexte)
+ * - syscall_wrapper: simple appel C, retour au contexte courant
  * ========================================================================== */
 
 extern uint32_t do_timer_logic(uint32_t old_esp);
@@ -17,6 +29,7 @@ extern void do_syscall_logic(uint32_t esp);
 
 __asm__(
     ".text \n"
+
     ".global timer_wrapper \n"
     "timer_wrapper: \n"
     "    pusha \n"
@@ -28,7 +41,7 @@ __asm__(
     "    pop %gs; pop %fs; pop %es; pop %ds \n"
     "    popa \n"
     "    iret \n"
-    
+
     ".global syscall_wrapper \n"
     "syscall_wrapper: \n"
     "    pusha \n"
@@ -45,72 +58,145 @@ __asm__(
 void timer_wrapper(void);
 void syscall_wrapper(void);
 
-/* ==========================================================================
- * 2. CONFIGURATION
+/* ============================================================================
+ * 2) CONFIG
+ * - P_USER_CODE_BASE : base physique de la section .user (4MB)
+ * - P_SHARED_PAGE    : page physique partagée (4KB)
+ * - V_SHARED_T1/T2   : VA différentes vers la même page physique
+ * - V_STACK_USER_TOP : top de pile user (descend)
  * ========================================================================== */
 
-#define P_USER_CODE_BASE 0x00400000 
+#define P_USER_CODE_BASE 0x00400000
 #define P_SHARED_PAGE    0x00A00000
-#define V_SHARED_T1      0x10000000 
-#define V_SHARED_T2      0x20000000 
-#define V_STACK_USER_TOP 0x40001000 
-#define MY_SEG_UCODE     0x2B 
-#define MY_SEG_UDATA     0x33 
-#define MY_SEG_TSS       0x38 
+#define V_SHARED_T1      0x10000000
+#define V_SHARED_T2      0x20000000
+#define V_STACK_USER_TOP 0x40001000
+
+#define MY_SEG_UCODE     0x2B
+#define MY_SEG_UDATA     0x33
+#define MY_SEG_TSS       0x38
+
 #define PDE_PRESENT 0x01
 #define PDE_RW      0x02
-#define PDE_USER    0x04 
-#define PDE_PS      0x80 
+#define PDE_USER    0x04
+#define PDE_PS      0x80
+
 #define SYSCALL_INT 0x80
 
-struct tss_entry_t { 
-    uint32_t link, esp0, ss0, esp1, ss1, esp2, ss2, cr3, eip, eflags, eax, ecx, edx, ebx, esp, ebp, esi, edi, es, cs, ss, ds, fs, gs, ldt; 
-    uint16_t trap, iomap_base; 
+/* TSS: sert surtout à fournir (SS0, ESP0) pour ring3->ring0. */
+struct tss_entry_t {
+    uint32_t link, esp0, ss0, esp1, ss1, esp2, ss2;
+    uint32_t cr3, eip, eflags;
+    uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs, ldt;
+    uint16_t trap, iomap_base;
 } __attribute__((packed));
 
-typedef struct { uint32_t kstack_top; uint32_t esp; uint32_t cr3; } task_t;
+/* Contexte minimal d'une tâche. */
+typedef struct {
+    uint32_t kstack_top; /* sommet pile noyau (adresse haute) */
+    uint32_t esp;        /* esp sauvegardé (contexte noyau) */
+    uint32_t cr3;        /* base PGD */
+} task_t;
 
 static task_t tasks[2];
 static int current_task_id = 0;
+
+/* Contexte noyau (idle) si IRQ arrive en CPL=0 */
+static uint32_t idle_esp = 0;
+/* Bootstrap: la 1ère IRQ0 en ring0 lance T1 */
+static int tasks_started = 0;
+
 static struct tss_entry_t my_tss;
-uint64_t my_new_gdt[16]; 
+uint64_t my_new_gdt[16];
 
-static uint8_t kstack_t1[4096] __attribute__((aligned(4096)));
-static uint8_t kstack_t2[4096] __attribute__((aligned(4096)));
-static uint8_t ustack_t1[4096] __attribute__((aligned(4096)));
-static uint8_t ustack_t2[4096] __attribute__((aligned(4096)));
-static uint32_t pgd_t1[1024] __attribute__((aligned(4096))), pgd_t2[1024] __attribute__((aligned(4096)));
-static uint32_t pt_stack_t1[1024] __attribute__((aligned(4096))), pt_stack_t2[1024] __attribute__((aligned(4096)));
-static uint32_t pt_shared_t1[1024] __attribute__((aligned(4096))), pt_shared_t2[1024] __attribute__((aligned(4096)));
+/* Ressources par tâche (piles + tables) */
+static uint8_t  kstack_t1[4096] __attribute__((aligned(4096)));
+static uint8_t  kstack_t2[4096] __attribute__((aligned(4096)));
+static uint8_t  ustack_t1[4096] __attribute__((aligned(4096)));
+static uint8_t  ustack_t2[4096] __attribute__((aligned(4096)));
 
-/* ==========================================================================
- * 3. SETUP HARDWARE
+static uint32_t pgd_t1[1024] __attribute__((aligned(4096)));
+static uint32_t pgd_t2[1024] __attribute__((aligned(4096)));
+
+static uint32_t pt_stack_t1[1024] __attribute__((aligned(4096)));
+static uint32_t pt_stack_t2[1024] __attribute__((aligned(4096)));
+
+static uint32_t pt_shared_t1[1024] __attribute__((aligned(4096)));
+static uint32_t pt_shared_t2[1024] __attribute__((aligned(4096)));
+
+/* ============================================================================
+ * 3) SETUP: GDT/TSS + Timer + Syscall
  * ========================================================================== */
 
 void setup_safe_gdt_and_tss(void) {
     struct { uint16_t limit; uint32_t base; } __attribute__((packed)) dtr;
     __asm__ volatile("sgdt %0" : "=m"(dtr));
+
+    /* Copie GDT -> my_new_gdt */
     uint8_t *old_gdt = (uint8_t *)dtr.base;
     uint8_t *new_gdt_ptr = (uint8_t *)my_new_gdt;
     for (int i = 0; i <= dtr.limit; i++) new_gdt_ptr[i] = old_gdt[i];
 
+    /* Ajout: code/data ring3 + TSS */
     uint8_t *gdt = (uint8_t *)my_new_gdt;
-    int i = 5 * 8; 
-    gdt[i+0]=0xFF; gdt[i+1]=0xFF; gdt[i+2]=0x00; gdt[i+3]=0x00; gdt[i+4]=0x00; gdt[i+5]=0xFA; gdt[i+6]=0xCF; gdt[i+7]=0x00;
-    i = 6 * 8; 
-    gdt[i+0]=0xFF; gdt[i+1]=0xFF; gdt[i+2]=0x00; gdt[i+3]=0x00; gdt[i+4]=0x00; gdt[i+5]=0xF2; gdt[i+6]=0xCF; gdt[i+7]=0x00;
-    
-    uint32_t base = (uint32_t)&my_tss; uint32_t limit = sizeof(my_tss) - 1;
-    i = 7 * 8; 
-    gdt[i+0]=limit&0xFF; gdt[i+1]=(limit>>8)&0xFF; gdt[i+2]=base&0xFF; gdt[i+3]=(base>>8)&0xFF; gdt[i+4]=(base>>16)&0xFF; gdt[i+5]=0x89; gdt[i+6]=0x00; gdt[i+7]=(base>>24)&0xFF;
 
-    dtr.base = (uint32_t)my_new_gdt; dtr.limit = (8 * 8) - 1;
+    int i = 5 * 8; /* code ring3 */
+    gdt[i+0]=0xFF; gdt[i+1]=0xFF; gdt[i+2]=0x00; gdt[i+3]=0x00;
+    gdt[i+4]=0x00; gdt[i+5]=0xFA; gdt[i+6]=0xCF; gdt[i+7]=0x00;
+
+    i = 6 * 8;     /* data ring3 */
+    gdt[i+0]=0xFF; gdt[i+1]=0xFF; gdt[i+2]=0x00; gdt[i+3]=0x00;
+    gdt[i+4]=0x00; gdt[i+5]=0xF2; gdt[i+6]=0xCF; gdt[i+7]=0x00;
+
+    uint32_t base = (uint32_t)&my_tss;
+    uint32_t limit = sizeof(my_tss) - 1;
+
+    i = 7 * 8;     /* TSS */
+    gdt[i+0]=limit&0xFF; gdt[i+1]=(limit>>8)&0xFF;
+    gdt[i+2]=base&0xFF;  gdt[i+3]=(base>>8)&0xFF;
+    gdt[i+4]=(base>>16)&0xFF; gdt[i+5]=0x89;
+    gdt[i+6]=0x00; gdt[i+7]=(base>>24)&0xFF;
+
+    dtr.base  = (uint32_t)my_new_gdt;
+    dtr.limit = (8 * 8) - 1;
     __asm__ volatile("lgdt %0" : : "m"(dtr));
     __asm__ volatile("ltr %%ax" :: "a"(MY_SEG_TSS));
 }
 
+/* IRQ0: détecte CPL via CS, bootstrap depuis ring0, sinon switch T1<->T2. */
 uint32_t do_timer_logic(uint32_t old_esp) {
-    outb(0x20, 0x20);
+    /* Debug léger (1/200) */
+    static uint32_t cnt = 0;
+    if ((cnt++ % 200) == 0) {
+        uint32_t *s_dbg = (uint32_t*)old_esp;
+        uint32_t cs_dbg = s_dbg[13];
+        debug("[TIMER] cs=0x%x cpl=%d cur=%d\n", cs_dbg, cs_dbg & 3, current_task_id);
+    }
+
+    outb(0x20, 0x20); /* EOI IRQ0 */
+
+    /* Layout wrapper: CS à s[13] */
+    uint32_t *s  = (uint32_t *)old_esp;
+    uint32_t cs  = s[13];
+    uint32_t cpl = cs & 3;
+
+    /* IRQ a interrompu ring0: ne pas écraser un contexte de tâche */
+    if (cpl == 0) {
+        idle_esp = old_esp;
+
+        /* Premier tick: démarrage de T1 */
+        if (!tasks_started) {
+            tasks_started = 1;
+            current_task_id = 0;
+            my_tss.esp0 = tasks[current_task_id].kstack_top;
+            __asm__ volatile("mov %0, %%cr3" :: "r"(tasks[current_task_id].cr3));
+            return tasks[current_task_id].esp;
+        }
+        return old_esp;
+    }
+
+    /* IRQ a interrompu ring3: vrai switch */
     tasks[current_task_id].esp = old_esp;
     current_task_id = (current_task_id + 1) % 2;
     my_tss.esp0 = tasks[current_task_id].kstack_top;
@@ -118,109 +204,142 @@ uint32_t do_timer_logic(uint32_t old_esp) {
     return tasks[current_task_id].esp;
 }
 
+/* Syscall int 0x80: lit EBX depuis la frame et affiche le compteur. */
 void do_syscall_logic(uint32_t esp) {
     uint32_t *stack = (uint32_t*)esp;
-    uint32_t ebx = stack[8]; 
+    uint32_t ebx = stack[8];
     if (ebx == 0) return;
-    printf("\n[Syscall] T2 Compteur: %d", *(uint32_t*)ebx);
+
+    /* Remplacement demandé: printf -> debug (même résultat, API noyau) */
+    debug("\n[Syscall] T2 Compteur: %d", *(uint32_t*)ebx);
 }
 
+/* Stub ring3: passe ptr via EBX puis int 0x80 */
 static inline void sys_counter(uint32_t *ptr) {
     __asm__ volatile("int $0x80" : : "b"(ptr));
 }
 
-/* ==========================================================================
- * 4. TÂCHES
+/* ============================================================================
+ * 4) USER TASKS (section .user)
  * ========================================================================== */
 
 void __attribute__((section(".user"))) user1(void) {
     volatile uint32_t *counter = (volatile uint32_t *)V_SHARED_T1;
-    *counter = 100; 
+    *counter = 100;
+
     for (;;) {
         (*counter)++;
-        for (volatile int i = 0; i < 50000; i++); 
+        for (volatile int i = 0; i < 50000000; i++);
     }
 }
 
 void __attribute__((section(".user"))) user2(void) {
     for (;;) {
         sys_counter((uint32_t *)V_SHARED_T2);
-        for (volatile int i = 0; i < 100000; i++);
+        for (volatile int i = 0; i < 100000000; i++);
     }
 }
 
-/* ==========================================================================
- * 5. INIT
+/* ============================================================================
+ * 5) INIT: paging + context + IDT + PIT + idle loop
  * ========================================================================== */
 
 void setup_task_paging(int task_id) {
-    uint32_t *pgd = (task_id == 0) ? pgd_t1 : pgd_t2;
+    uint32_t *pgd      = (task_id == 0) ? pgd_t1      : pgd_t2;
     uint32_t *pt_stack = (task_id == 0) ? pt_stack_t1 : pt_stack_t2;
-    uint32_t *pt_shared = (task_id == 0) ? pt_shared_t1 : pt_shared_t2;
-    uint32_t v_shared = (task_id == 0) ? V_SHARED_T1 : V_SHARED_T2;
+    uint32_t *pt_shared= (task_id == 0) ? pt_shared_t1: pt_shared_t2;
+    uint32_t  v_shared = (task_id == 0) ? V_SHARED_T1 : V_SHARED_T2;
 
-    for(int i=0; i<1024; i++) pgd[i] = 0;
+    for (int i = 0; i < 1024; i++) pgd[i] = 0;
 
-    /* === LE CORRECTIF EST ICI === */
-    /* On ajoute PDE_USER pour autoriser user1 à s'exécuter à 0x304267 */
-    pgd[0] = 0x0 | PDE_PRESENT | PDE_RW | PDE_PS | PDE_USER; 
-    
+    /* Mapping 0..4MB (4MB page). */
+    pgd[0] = 0x0 | PDE_PRESENT | PDE_RW | PDE_PS | PDE_USER;
+
+    /* Mapping 4..8MB (code user en .user si linker). */
     pgd[1] = P_USER_CODE_BASE | PDE_PRESENT | PDE_RW | PDE_USER | PDE_PS;
+
+    /* Pile user: 1 page via PT */
     pgd[256] = (uint32_t)pt_stack | PDE_PRESENT | PDE_RW | PDE_USER;
-    pt_stack[0] = (uint32_t)((task_id == 0) ? ustack_t1 : ustack_t2) | PDE_PRESENT | PDE_RW | PDE_USER;
+    pt_stack[0] = (uint32_t)((task_id == 0) ? ustack_t1 : ustack_t2)
+                  | PDE_PRESENT | PDE_RW | PDE_USER;
+
+    /* Page partagée: 1 page via PT */
     pgd[v_shared >> 22] = (uint32_t)pt_shared | PDE_PRESENT | PDE_RW | PDE_USER;
     pt_shared[0] = P_SHARED_PAGE | PDE_PRESENT | PDE_RW | PDE_USER;
 
     tasks[task_id].cr3 = (uint32_t)pgd;
 }
 
+/* Forge une pile noyau telle que: pop seg; popa; iret => entrée ring3. */
 void forge_context(int task_id) {
     uint32_t *k = (uint32_t*) tasks[task_id].kstack_top;
-    *(--k) = MY_SEG_UDATA; *(--k) = V_STACK_USER_TOP; *(--k) = 0x202; *(--k) = MY_SEG_UCODE;
+
+    *(--k) = MY_SEG_UDATA;
+    *(--k) = V_STACK_USER_TOP;
+    *(--k) = 0x202;
+    *(--k) = MY_SEG_UCODE;
     *(--k) = (task_id == 0) ? (uint32_t)user1 : (uint32_t)user2;
-    for(int i=0; i<8; i++) *(--k) = 0;
-    for(int i=0; i<4; i++) *(--k) = MY_SEG_UDATA; 
+
+    for (int i = 0; i < 8; i++) *(--k) = 0;
+    for (int i = 0; i < 4; i++) *(--k) = MY_SEG_UDATA;
+
     tasks[task_id].esp = (uint32_t)k;
 }
 
 void tp(void) {
     tasks[0].kstack_top = (uint32_t)kstack_t1 + 4096;
     tasks[1].kstack_top = (uint32_t)kstack_t2 + 4096;
-    
+
     setup_safe_gdt_and_tss();
-    my_tss.ss0 = 0x10; my_tss.esp0 = tasks[0].kstack_top;
-    
+
+    my_tss.ss0  = 0x10;
+    my_tss.esp0 = tasks[0].kstack_top;
+
     struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idtr;
     __asm__ volatile("sidt %0" : "=m"(idtr));
-    struct gate { uint16_t l, s; uint8_t r, f; uint16_t h; } __attribute__((packed)) *idt = (void*)idtr.base;
-    
+
+    struct gate {
+        uint16_t l, s;
+        uint8_t  r, f;
+        uint16_t h;
+    } __attribute__((packed)) *idt = (void*)idtr.base;
+
     uint32_t b = (uint32_t)timer_wrapper;
-    idt[32].l = b & 0xFFFF; idt[32].h = b >> 16; idt[32].s = 0x08; idt[32].f = 0x8E;
+    idt[32].l = b & 0xFFFF; idt[32].h = b >> 16;
+    idt[32].s = 0x08; idt[32].f = 0x8E;
+
     b = (uint32_t)syscall_wrapper;
-    idt[0x80].l = b & 0xFFFF; idt[0x80].h = b >> 16; idt[0x80].s = 0x08; idt[0x80].f = 0xEE;
+    idt[0x80].l = b & 0xFFFF; idt[0x80].h = b >> 16;
+    idt[0x80].s = 0x08; idt[0x80].f = 0xEE;
 
-    setup_task_paging(0); setup_task_paging(1);
-    forge_context(0); forge_context(1);
+    setup_task_paging(0);
+    setup_task_paging(1);
+    forge_context(0);
+    forge_context(1);
 
-    outb(0x43, 0x36); outb(0x40, 11931 & 0xFF); outb(0x40, 11931 >> 8);
+    outb(0x43, 0x36);
+    outb(0x40, 11931 & 0xFF);
+    outb(0x40, 11931 >> 8);
     outb(0x21, inb(0x21) & ~0x01);
 
-    debug("[INIT] Launching Task 1...\n");
-    
+    debug("[INIT] Paging ON, entering idle loop (ring0)...\n");
+
     __asm__ volatile (
         "mov %0, %%cr3 \n\t"
         "mov %%cr4, %%eax \n\t"
-        "or $0x00000010, %%eax \n\t" /* PSE ON */
+        "or $0x00000010, %%eax \n\t"
         "mov %%eax, %%cr4 \n\t"
         "mov %%cr0, %%eax \n\t"
-        "or $0x80000000, %%eax \n\t" /* PG ON */
+        "or $0x80000000, %%eax \n\t"
         "mov %%eax, %%cr0 \n\t"
-        
-        "mov %1, %%esp \n\t"
-        "pop %%gs; pop %%fs; pop %%es; pop %%ds \n\t"
-        "popa \n\t"
-        "iret" 
-        : : "r" (tasks[0].cr3), "r" (tasks[0].esp) : "eax", "memory"
+        "sti \n\t"
+        :
+        : "r"(tasks[0].cr3)
+        : "eax", "memory"
     );
-    while(1);
+
+    for (;;) __asm__ volatile("hlt");
+
+    while (1);
 }
+
