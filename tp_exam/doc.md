@@ -132,7 +132,20 @@ Les flags **PDE_USER** et **PDE_RW** sont appliqués uniquement sur :
 
 Le noyau reste majoritairement protégé, tout en conservant un identity mapping pour garantir la stabilité des interruptions et du bootstrap initial.
 
+
+--- 
+
+## 4. Limites connues et points de vigilance
+
+### 4.1 Protection stricte noyau / utilisateur
+
+Une séparation stricte des droits (suppression complète de `PDE_USER` sur les mappings bas) a été envisagée.
+Cependant, le **bootstrap initial vers le Ring 3**, basé sur une frame `iret` forgée, reste sensible à l’emplacement exact des mappings.
+
+Par manque de temps, une protection totalement hermétique n’a pas été finalisée sans compromettre l’exécution.
+
 ---
+
 
 ## Conclusion
 
